@@ -150,8 +150,9 @@ class AnalyticsVisualizationStack(Stack):
             "systemctl restart postgresql",
 
             # ------------------------
-            # DB + ROLE SETUP (SAFE IDENTITY)
+            # DB + ROLE SETUP (ISPRAVLJENO)
             # ------------------------
+            # Kreiramo ROLE unutar DO bloka (dozvoljeno)
             "sudo -u postgres psql -v ON_ERROR_STOP=1 <<SQL\n"
             "DO \\$\\$\n"
             "BEGIN\n"
@@ -160,30 +161,21 @@ class AnalyticsVisualizationStack(Stack):
             "   END IF;\n"
             "END\n"
             "\\$\\$;\n"
-            "\n"
-            "DO \\$\\$\n"
-            "BEGIN\n"
-            "   IF NOT EXISTS (SELECT FROM pg_database WHERE datname = 'analytics') THEN\n"
-            "      CREATE DATABASE analytics OWNER ${DB_USER};\n"
-            "   END IF;\n"
-            "END\n"
-            "\\$\\$;\n"
-            "\n"
-            "DO \\$\\$\n"
-            "BEGIN\n"
-            "   IF NOT EXISTS (SELECT FROM pg_database WHERE datname = 'superset_meta') THEN\n"
-            "      CREATE DATABASE superset_meta OWNER ${DB_USER};\n"
-            "   END IF;\n"
-            "END\n"
-            "\\$\\$;\n"
             "SQL",
+
+            # Kreiramo baze VAN DO bloka, uz proveru postojanja
+            "sudo -u postgres psql -tAc \"SELECT 1 FROM pg_database WHERE datname='analytics'\" | grep -q 1 || "
+            "sudo -u postgres psql -v ON_ERROR_STOP=1 -c \"CREATE DATABASE analytics OWNER ${DB_USER};\"",
+
+            "sudo -u postgres psql -tAc \"SELECT 1 FROM pg_database WHERE datname='superset_meta'\" | grep -q 1 || "
+            "sudo -u postgres psql -v ON_ERROR_STOP=1 -c \"CREATE DATABASE superset_meta OWNER ${DB_USER};\"",
 
             # ------------------------
             # PYTHON ENV
             # ------------------------
             "python3.11 -m venv /opt/superset-venv",
             "/opt/superset-venv/bin/pip install --upgrade pip",
-            "/opt/superset-venv/bin/pip install apache-superset pg8000 psycopg2-binary gunicorn rich",
+            "/opt/superset-venv/bin/pip install apache-superset pg8000 psycopg2-binary gunicorn rich cachetools",
 
             # ------------------------
             # SUPERSET CONFIG
