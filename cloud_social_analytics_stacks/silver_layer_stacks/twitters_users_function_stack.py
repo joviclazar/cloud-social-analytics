@@ -48,7 +48,7 @@ class TwitterUsersSilverStack(Stack):
             layers=[wrangler_layer],
         )
 
-        self.twitter_users_fn = fn
+        twitter_users_fn = fn
 
         CfnOutput(
             self,

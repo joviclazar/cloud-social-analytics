@@ -17,16 +17,15 @@ def write_gold(df, path, partition_cols):
         partition_cols=partition_cols
     )
 
-def compute_dq_chunked(path, max_rows=50000):
+def compute_dq_chunked(path, max_rows=50000, partition_filter=None):
     total_rows = 0
     total_cells = 0
     non_null_cells = 0
     try:
-        chunks = wr.s3.read_parquet(
-            path=path,
-            dataset=True,
-            chunked=True
-        )
+        read_kwargs = {"path": path, "dataset": True, "chunked": True}
+        if partition_filter is not None:
+            read_kwargs["partition_filter"] = partition_filter
+        chunks = wr.s3.read_parquet(**read_kwargs)
         for chunk in chunks:
             rows, cols = chunk.shape
             total_rows += rows
@@ -34,7 +33,8 @@ def compute_dq_chunked(path, max_rows=50000):
             non_null_cells += int(chunk.notna().sum().sum())
             if total_rows >= max_rows:
                 break
-    except Exception:
+    except Exception as e:
+        print(f"[compute_dq_chunked] error for {path}: {e}")
         return total_rows, 0.0
     dq_score = round((non_null_cells / total_cells * 100), 2) if total_cells > 0 else 0.0
     return total_rows, dq_score
@@ -78,17 +78,24 @@ def handler(event, context):
         write_gold(tf, f"s3://{BUCKET_NAME}/gold/top_twitter_users_by_followers/", ["snapshot_date"])
 
     yesterday = datetime.now(timezone.utc).date() - timedelta(days=1)
-    pf = [("year", "==", int(yesterday.year)), ("month", "==", int(yesterday.month)), ("day", "==", int(yesterday.day))]
+    y, m, d = int(yesterday.year), int(yesterday.month), int(yesterday.day)
+
+    def yesterday_partition_filter(partition):
+        return (
+            partition.get("year") == str(y)
+            and partition.get("month") == str(m)
+            and partition.get("day") == str(d)
+        )
 
     tables = {
-        "silver_posts": (f"s3://{BUCKET_NAME}/silver/posts/", pf),
+        "silver_posts": (f"s3://{BUCKET_NAME}/silver/posts/", yesterday_partition_filter),
         "silver_hn_users": (f"s3://{BUCKET_NAME}/silver/users/platform=HackerNews/", None),
         "silver_twitter_users": (f"s3://{BUCKET_NAME}/silver/users/platform=X/", None),
     }
 
     rows = []
     for tn, (p, f) in tables.items():
-        tr, ds = compute_dq_chunked(p)
+        tr, ds = compute_dq_chunked(p, partition_filter=f)
         rows.append({"table_name": tn, "total_rows": tr, "non_null_pct": ds, "snapshot_date": TODAY})
 
     write_gold(pd.DataFrame(rows), f"s3://{BUCKET_NAME}/gold/data_quality_score/", ["snapshot_date"])

@@ -97,19 +97,27 @@ def handler(event, context):
     
     y, m, d = int(target.year), int(target.month), int(target.day)
 
+    def day_partition_filter(partition):
+        return (
+            partition.get("year") == str(y)
+            and partition.get("month") == str(m)
+            and partition.get("day") == str(d)
+        )
+
     try:
         chunks = wr.s3.read_parquet(
             path=f"s3://{BUCKET_NAME}/silver/posts/",
             dataset=True,
             chunked=True,
-            filters=[("year", "==", y), ("month", "==", m), ("day", "==", d)]
+            partition_filter=day_partition_filter
         )
         daily_counts = {}
         for chunk in chunks:
             hn_chunk = chunk[chunk["post_type"].isin(HN_POST_TYPES)]
             for pt, cnt in hn_chunk["post_type"].value_counts().items():
                 daily_counts[pt] = daily_counts.get(pt, 0) + cnt
-    except Exception:
+    except Exception as e:
+        print(f"[daily_hn_posts_metric] error: {e}")
         daily_counts = {}
 
     if daily_counts:
