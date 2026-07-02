@@ -99,18 +99,28 @@ class AnalyticsVisualizationStack(Stack):
             "if [ -f /etc/superset/.provisioned ]; then "
             "echo 'Vec provisionovano, preskacem setup'; exit 0; fi",
 
+            # ------------------------
+            # SYSTEM PACKAGES
+            # ------------------------
             "dnf update -y",
             "dnf install -y postgresql15 postgresql15-server postgresql15-contrib "
             "python3.11 python3.11-pip python3.11-devel gcc gcc-c++ make "
             "libffi-devel openssl-devel cyrus-sasl-devel openldap-devel jq",
 
+            # ------------------------
+            # POSTGRES INIT
+            # ------------------------
             "postgresql-setup --initdb",
             "systemctl enable postgresql",
             "systemctl start postgresql",
 
+            # ------------------------
+            # SECRETS
+            # ------------------------
             f"SECRET_JSON=$(aws secretsmanager get-secret-value "
             f"--secret-id {db_secret.secret_arn} --region {self.region} "
             f"--query SecretString --output text)",
+
             "DB_USER=$(echo \"$SECRET_JSON\" | jq -r .username)",
             "DB_PASS=$(echo \"$SECRET_JSON\" | jq -r .password)",
 
@@ -118,64 +128,107 @@ class AnalyticsVisualizationStack(Stack):
             f"--secret-id {superset_secret.secret_arn} --region {self.region} "
             f"--query SecretString --output text)",
 
-            "sudo -u postgres psql -tAc "
-            "\"SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}'\" | grep -q 1 || "
-            "sudo -u postgres psql -v ON_ERROR_STOP=1 "
-            "-c \"CREATE ROLE ${DB_USER} WITH LOGIN SUPERUSER PASSWORD '${DB_PASS}';\"",
-
-            "sudo -u postgres psql -tAc "
-            "\"SELECT 1 FROM pg_database WHERE datname='analytics'\" | grep -q 1 || "
-            "sudo -u postgres psql -v ON_ERROR_STOP=1 "
-            "-c \"CREATE DATABASE analytics OWNER ${DB_USER};\"",
-
-            "sudo -u postgres psql -tAc "
-            "\"SELECT 1 FROM pg_database WHERE datname='superset_meta'\" | grep -q 1 || "
-            "sudo -u postgres psql -v ON_ERROR_STOP=1 "
-            "-c \"CREATE DATABASE superset_meta OWNER ${DB_USER};\"",
-
+            # ------------------------
+            # FIX pg_hba.conf (ISPRAVLJENO)
+            # ------------------------
             "HBA=$(sudo -u postgres psql -tAc \"show hba_file;\")",
-            # Postgres prima konekcije SAMO iz VPC CIDR opsega, ne sa
-            # celog interneta (0.0.0.0/0). Ingress na 5432 je dodatno
-            # ograničen i na nivou SG-a (samo db_loader_sg), ovo je
-            # drugi sloj zaštite na nivou same baze.
-            f"grep -q '{vpc.vpc_cidr_block} md5' \"$HBA\" || "
+
+            # SAMO ident -> md5; PEER OSTAVLJAMO za lokalne socket konekcije
+            "sed -i 's/ident/md5/g' \"$HBA\" || true",
+
+            # eksplicitno dozvoli TCP konekcije uz md5
+            f"echo \"host all all 127.0.0.1/32 md5\" | sudo tee -a \"$HBA\"",
+            f"echo \"host all all ::1/128 md5\" | sudo tee -a \"$HBA\"",
             f"echo \"host all all {vpc.vpc_cidr_block} md5\" | sudo tee -a \"$HBA\"",
+
+            # ------------------------
+            # POSTGRES CONFIG
+            # ------------------------
             "sudo sed -i \"s/^#listen_addresses.*/listen_addresses = '*'/\" "
             "$(sudo -u postgres psql -tAc \"show config_file;\")",
+
             "systemctl restart postgresql",
 
+            # ------------------------
+            # DB + ROLE SETUP (SAFE IDENTITY)
+            # ------------------------
+            "sudo -u postgres psql -v ON_ERROR_STOP=1 <<SQL\n"
+            "DO \\$\\$\n"
+            "BEGIN\n"
+            "   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${DB_USER}') THEN\n"
+            "      CREATE ROLE ${DB_USER} WITH LOGIN PASSWORD '${DB_PASS}' SUPERUSER;\n"
+            "   END IF;\n"
+            "END\n"
+            "\\$\\$;\n"
+            "\n"
+            "DO \\$\\$\n"
+            "BEGIN\n"
+            "   IF NOT EXISTS (SELECT FROM pg_database WHERE datname = 'analytics') THEN\n"
+            "      CREATE DATABASE analytics OWNER ${DB_USER};\n"
+            "   END IF;\n"
+            "END\n"
+            "\\$\\$;\n"
+            "\n"
+            "DO \\$\\$\n"
+            "BEGIN\n"
+            "   IF NOT EXISTS (SELECT FROM pg_database WHERE datname = 'superset_meta') THEN\n"
+            "      CREATE DATABASE superset_meta OWNER ${DB_USER};\n"
+            "   END IF;\n"
+            "END\n"
+            "\\$\\$;\n"
+            "SQL",
+
+            # ------------------------
+            # PYTHON ENV
+            # ------------------------
             "python3.11 -m venv /opt/superset-venv",
             "/opt/superset-venv/bin/pip install --upgrade pip",
+            "/opt/superset-venv/bin/pip install apache-superset pg8000 psycopg2-binary gunicorn rich",
 
-            "/opt/superset-venv/bin/pip install apache-superset pg8000 psycopg2-binary gunicorn",
-
+            # ------------------------
+            # SUPERSET CONFIG
+            # ------------------------
             "mkdir -p /etc/superset",
             "cat > /etc/superset/superset_config.py <<EOF\n"
             "SECRET_KEY = '${SUPERSET_SECRET}'\n"
-            "SQLALCHEMY_DATABASE_URI = 'postgresql+pg8000://${DB_USER}:${DB_PASS}@localhost/superset_meta'\n"
+            "SQLALCHEMY_DATABASE_URI = 'postgresql+pg8000://${DB_USER}:${DB_PASS}@127.0.0.1:5432/superset_meta'\n"
             "EOF",
 
             "export SUPERSET_CONFIG_PATH=/etc/superset/superset_config.py",
             "export FLASK_APP=superset",
+
+            # ------------------------
+            # SUPERSET INIT
+            # ------------------------
             "/opt/superset-venv/bin/superset db upgrade",
             "/opt/superset-venv/bin/superset fab create-admin "
             "--username admin --firstname admin --lastname admin "
-            "--email admin@local.com --password \"${DB_PASS}\"",
+            "--email admin@local.com --password \"${DB_PASS}\" || true",
             "/opt/superset-venv/bin/superset init",
 
+            # ------------------------
+            # ANALYTICS DB REGISTRATION
+            # ------------------------
             "/opt/superset-venv/bin/superset set-database-uri "
             "--database_name \"AnalyticsDB\" "
-            "--uri \"postgresql+pg8000://${DB_USER}:${DB_PASS}@localhost/analytics\"",
+            "--uri \"postgresql+pg8000://${DB_USER}:${DB_PASS}@127.0.0.1:5432/analytics\" || true",
 
+            # ------------------------
+            # SYSTEMD
+            # ------------------------
             "cat > /etc/systemd/system/superset.service <<EOF\n"
             "[Unit]\nDescription=Apache Superset\nAfter=network.target postgresql.service\n\n"
             "[Service]\nEnvironment=SUPERSET_CONFIG_PATH=/etc/superset/superset_config.py\n"
             "ExecStart=/opt/superset-venv/bin/gunicorn -w 4 -b 0.0.0.0:8088 'superset.app:create_app()'\n"
             "Restart=always\nUser=root\n\n[Install]\nWantedBy=multi-user.target\nEOF",
+
             "systemctl daemon-reload",
             "systemctl enable superset",
             "systemctl start superset",
 
+            # ------------------------
+            # DONE FLAG
+            # ------------------------
             "touch /etc/superset/.provisioned",
         )
 
@@ -190,6 +243,7 @@ class AnalyticsVisualizationStack(Stack):
             security_group=ec2_security_group,
             role=ec2_role,
             user_data=user_data,
+            user_data_causes_replacement=True,
         )
 
         aws_sdk_pandas_layer = _lambda.LayerVersion.from_layer_version_arn(
@@ -200,6 +254,12 @@ class AnalyticsVisualizationStack(Stack):
 
         lambda_bundling = BundlingOptions(
             image=_lambda.Runtime.PYTHON_3_11.bundling_image,
+            # user="root": na Windows-u (Docker Desktop, WSL2 backend)
+            # podrazumevani CDK non-root korisnik (uid 1000) nema write
+            # pristup mapiranom /asset-output folderu, pa pip install
+            # puca sa "docker exited with status 1" bez jasne poruke u
+            # izlazu. Pokretanje kao root u kontejneru to zaobilazi.
+            user="root",
             command=[
                 "bash", "-c",
                 "pip install --no-cache-dir sqlalchemy pg8000 -t /asset-output && cp -au . /asset-output",

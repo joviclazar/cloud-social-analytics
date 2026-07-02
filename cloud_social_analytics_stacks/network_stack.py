@@ -91,7 +91,7 @@ class NetworkStack(Stack):
         self.processing_sg.add_egress_rule(
             ec2.Peer.prefix_list(s3_prefix_list_id),
             ec2.Port.tcp(443),
-            "HTTPS ka S3 preko gateway endpoint-a (ograničeno na S3 IP opseg)",
+            "HTTPS ka S3 preko gateway endpoint-a (ograniceno na S3 IP opseg)",
         )
 
         self.db_loader_sg = ec2.SecurityGroup(
@@ -104,7 +104,7 @@ class NetworkStack(Stack):
         self.db_loader_sg.add_egress_rule(
             ec2.Peer.prefix_list(s3_prefix_list_id),
             ec2.Port.tcp(443),
-            "HTTPS ka S3 preko gateway endpoint-a (ograničeno na S3 IP opseg)",
+            "HTTPS ka S3 preko gateway endpoint-a (ograniceno na S3 IP opseg)",
         )
 
         self.ec2_db_sg = ec2.SecurityGroup(
