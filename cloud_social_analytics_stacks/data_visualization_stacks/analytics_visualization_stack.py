@@ -4,6 +4,8 @@ from aws_cdk import (
     aws_iam as iam,
     aws_lambda as _lambda,
     aws_secretsmanager as secretsmanager,
+    aws_events as events,
+    aws_events_targets as targets,
     BundlingOptions,
     Duration,
     aws_s3 as s3,
@@ -161,39 +163,84 @@ class AnalyticsVisualizationStack(Stack):
             user_data=user_data,
         )
 
-        _lambda.Function(
+        pg_conn = (
+            "postgresql+pg8000://"
+            f"{db_secret.secret_value_from_json('username').unsafe_unwrap()}:"
+            f"{db_secret.secret_value_from_json('password').unsafe_unwrap()}"
+            f"@{instance.instance_public_dns_name}:5432/analytics"
+        )
+
+        aws_sdk_pandas_layer = _lambda.LayerVersion.from_layer_version_arn(
+            self,
+            "AwsSdkPandasLayer",
+            f"arn:aws:lambda:{self.region}:336392948345:layer:AWSSDKPandas-Python311:21",
+        )
+
+        lambda_bundling = BundlingOptions(
+            image=_lambda.Runtime.PYTHON_3_11.bundling_image,
+            command=[
+                "bash", "-c",
+                "pip install --no-cache-dir sqlalchemy pg8000 -t /asset-output && cp -au . /asset-output",
+            ],
+        )
+
+        # Inkrementalna lambda - čita samo najnoviji parquet fajl po metrici.
+        # Okida se automatski svakog dana preko EventBridge rule ispod.
+        incremental_lambda = _lambda.Function(
             self,
             "GoldToPostgresLambda",
             runtime=_lambda.Runtime.PYTHON_3_11,
             handler="lambda_incremental_handler.lambda_handler",
             code=_lambda.Code.from_asset(
                 "lambdas/analyticsVisualization",
-                bundling=BundlingOptions(
-                    image=_lambda.Runtime.PYTHON_3_11.bundling_image,
-                    command=[
-                        "bash", "-c",
-                        "pip install --no-cache-dir sqlalchemy pg8000 -t /asset-output && cp -au . /asset-output",
-                    ],
-                ),
+                bundling=lambda_bundling,
             ),
-            layers=[
-                _lambda.LayerVersion.from_layer_version_arn(
-                    self,
-                    "AwsSdkPandasLayer",
-                    f"arn:aws:lambda:{self.region}:336392948345:layer:AWSSDKPandas-Python311:21",
-                ),
-            ],
+            layers=[aws_sdk_pandas_layer],
             timeout=Duration.minutes(10),
             memory_size=1024,
             role=lambda_role,
             environment={
                 "S3_BUCKET": data_lake.bucket_name,
                 "S3_PREFIX": "gold/",
-                "PG_CONN": (
-                    "postgresql+pg8000://"
-                    f"{db_secret.secret_value_from_json('username').unsafe_unwrap()}:"
-                    f"{db_secret.secret_value_from_json('password').unsafe_unwrap()}"
-                    f"@{instance.instance_public_dns_name}:5432/analytics"
-                ),
+                "PG_CONN": pg_conn,
+            },
+        )
+
+        # EventBridge rule: pokreće inkrementalnu lambdu svakog dana u 15h.
+        # Napomena: cron izrazi u EventBridge-u su uvek u UTC i ne prate
+        # letnje/zimsko računanje vremena. 13:00 UTC odgovara 15:00 po
+        # centralnoevropskom letnjem vremenu (CEST, UTC+2); zimi (CET,
+        # UTC+1) će ovo okinuti u 14:00 po lokalnom vremenu. Ako ti treba
+        # da uvek bude tačno 15h po lokalnom vremenu tokom cele godine,
+        # potrebno je ručno menjati cron izraz dva puta godišnje.
+        daily_backfill_schedule = events.Rule(
+            self,
+            "GoldToPostgresDailySchedule",
+            schedule=events.Schedule.cron(minute="0", hour="13"),
+        )
+        daily_backfill_schedule.add_target(targets.LambdaFunction(incremental_lambda))
+
+        # Full-backfill lambda - čita SVE parquet fajlove po metrici i
+        # popunjava postgres od nule. Namerno nema nikakav trigger
+        # (ni EventBridge, ni S3 event) - poziva se isključivo ručno,
+        # preko AWS konzole (Lambda -> Test) ili CLI-ja, kad zatreba
+        # potpuni reload podataka.
+        _lambda.Function(
+            self,
+            "GoldToPostgresFullBackfillLambda",
+            runtime=_lambda.Runtime.PYTHON_3_11,
+            handler="lambda_full_backfill.lambda_handler",
+            code=_lambda.Code.from_asset(
+                "lambdas/analyticsVisualization",
+                bundling=lambda_bundling,
+            ),
+            layers=[aws_sdk_pandas_layer],
+            timeout=Duration.minutes(15),
+            memory_size=1024,
+            role=lambda_role,
+            environment={
+                "S3_BUCKET": data_lake.bucket_name,
+                "S3_PREFIX": "gold/",
+                "PG_CONN": pg_conn,
             },
         )

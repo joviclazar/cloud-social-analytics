@@ -32,7 +32,12 @@ def list_parquet_files():
     return files
 
 
-def get_latest_per_metric(files):
+def get_all_files_per_metric(files):
+    """Groups ALL parquet files by metric (instead of resolving only the
+    latest one per metric). Files within each metric are sorted oldest ->
+    newest by LastModified, so that when we upsert file-by-file, later
+    files naturally overwrite earlier ones on primary-key conflict and we
+    end up with the most recent version of every row."""
     grouped = defaultdict(list)
 
     for f in files:
@@ -45,13 +50,17 @@ def get_latest_per_metric(files):
         metric = parts[1]
         grouped[metric].append(f)
 
-    latest = {}
+    all_files = {}
     for metric, items in grouped.items():
-        latest_file = max(items, key=lambda x: x["LastModified"])
-        latest[metric] = latest_file["Key"]
+        items_sorted = sorted(items, key=lambda x: x["LastModified"])
+        all_files[metric] = [item["Key"] for item in items_sorted]
 
-    logger.info(f"Resolved latest files for {len(latest)} metrics")
-    return latest
+    total_files = sum(len(v) for v in all_files.values())
+    logger.info(
+        f"Resolved {total_files} files across {len(all_files)} metrics "
+        f"for full backfill"
+    )
+    return all_files
 
 
 def parse_hive_partitions(key):
@@ -239,43 +248,71 @@ def batch_upsert(engine, df, table_name, pk):
     logger.info(f"Finished upsert for {table_name}")
 
 
-def lambda_handler(event, context):
+def process_metric(engine, metric, keys):
+    """Reads and upserts every parquet file for a metric one at a time,
+    so memory usage stays bounded to a single file regardless of how much
+    history the metric has. Files are processed oldest -> newest, and
+    since batch_upsert does ON CONFLICT DO UPDATE, a row from a later
+    file naturally overwrites the same PK from an earlier file."""
+    table_name = sanitize_table_name(metric)
+    logger.info(f"Processing metric: {metric} as table {table_name} ({len(keys)} files)")
 
-    logger.info("Lambda started")
+    pk = None
+    total_rows = 0
 
-    engine = create_engine(normalize_pg_conn(PG_CONN), pool_pre_ping=True)
+    for idx, key in enumerate(keys):
+        df = read_parquet(key)
 
-    files = list_parquet_files()
-    latest_files = get_latest_per_metric(files)
+        if df.empty:
+            continue
 
-    results = []
-
-    for metric, key in latest_files.items():
-        try:
-            table_name = sanitize_table_name(metric)
-            logger.info(f"Processing metric: {metric} as table {table_name}")
-
-            df = read_parquet(key)
-
-            if df.empty:
-                continue
-
+        if pk is None:
+            # Determine PK and ensure table exists using the first
+            # non-empty file we encounter for this metric.
             pk = detect_pk(df, table_name)
-
             if pk is None:
                 raise Exception(f"No primary key found for metric {metric}")
 
             ensure_correct_schema(engine, table_name, pk)
             create_table_if_not_exists(engine, table_name, df, pk)
 
-            df = df.drop_duplicates(subset=pk)
+        # Guard against duplicate PKs within a single file: a multi-row
+        # INSERT can't ON CONFLICT the same row twice in one statement.
+        df = df.drop_duplicates(subset=pk, keep="last")
 
-            batch_upsert(engine, df, table_name, pk)
+        batch_upsert(engine, df, table_name, pk)
+        total_rows += len(df)
+
+        logger.info(
+            f"Finished file {idx + 1}/{len(keys)} for metric {metric} "
+            f"({total_rows} rows upserted so far)"
+        )
+
+    if pk is None:
+        raise Exception(f"All files empty or no data found for metric {metric}")
+
+    return table_name, pk, total_rows
+
+
+def lambda_handler(event, context):
+
+    logger.info("Lambda started (FULL BACKFILL mode - reading ALL parquet files, file-by-file)")
+
+    engine = create_engine(normalize_pg_conn(PG_CONN), pool_pre_ping=True)
+
+    files = list_parquet_files()
+    files_per_metric = get_all_files_per_metric(files)
+
+    results = []
+
+    for metric, keys in files_per_metric.items():
+        try:
+            table_name, pk, total_rows = process_metric(engine, metric, keys)
 
             results.append({
                 "metric": table_name,
-                "file": key,
-                "rows": len(df),
+                "files": len(keys),
+                "rows": total_rows,
                 "pk": pk
             })
 
