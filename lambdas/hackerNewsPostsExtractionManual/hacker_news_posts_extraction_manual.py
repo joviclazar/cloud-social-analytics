@@ -76,7 +76,7 @@ def handler(event, context):
                 "content_text": content,
                 "post_type": detect_post_type(item),
                 "created_at": created_at,
-                "score": item.get("points")
+                "score": pd.to_numeric(item.get("points"), errors="coerce")
             })
 
             children = item.get("children") or item.get("kids") or []
@@ -98,6 +98,7 @@ def handler(event, context):
     posts_df = pd.DataFrame(posts_rows)
 
     if not posts_df.empty:
+        posts_df["score"] = pd.to_numeric(posts_df["score"], errors="coerce").astype("Int64")
         posts_df["year"] = posts_df["created_at"].dt.year
         posts_df["month"] = posts_df["created_at"].dt.month
         posts_df["day"] = posts_df["created_at"].dt.day

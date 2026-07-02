@@ -73,6 +73,7 @@ def top_n_largest_chunked(path, row_filter, sort_col, n, select_cols):
         for col, val in row_filter.items():
             if col in chunk.columns:
                 chunk = chunk[chunk[col] == val]
+        chunk[sort_col] = pd.to_numeric(chunk[sort_col], errors="coerce")
         chunk = chunk[chunk[sort_col].notna()]
         print(f"[chunk {chunk_count}] after filter: {len(chunk)} rows")
         if chunk.empty:
@@ -166,9 +167,10 @@ def handler(event, context):
         bottom_karma["snapshot_date"] = snapshot_date
         write_gold(bottom_karma, f"s3://{BUCKET_NAME}/gold/top_hn_users_low_karma/", ["snapshot_date"])
 
-    top_jobs = top_n_recent_chunked(
+    top_jobs = top_n_largest_chunked(
         path=f"s3://{BUCKET_NAME}/silver/posts/",
         row_filter={"post_type": "job"},
+        sort_col="score",
         n=10,
         select_cols=["post_id", "author_username", "content_text", "score"]
     )
