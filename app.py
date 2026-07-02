@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
+import os
 from aws_cdk import App, Environment, Aspects
 from cloud_social_analytics_stacks.bronze_layer_stacks.data_stack.data_stack import DataStack
 from cloud_social_analytics_stacks.bronze_layer_stacks.function_stacks.twitter_fetcher_function_stack import TwitterFetcherFunctionStack
 from cloud_social_analytics_stacks.bronze_layer_stacks.function_stacks.hacker_news_fetcher_function_stack import HackerNewsFetcherFunctionStack
+from cloud_social_analytics_stacks.data_visualization_stacks.analytics_visualization_stack import AnalyticsVisualizationStack
 from cloud_social_analytics_stacks.notifier_stack import NotifierStack
 from cloud_social_analytics_stacks.silver_layer_stacks.hacker_news_posts_function_stack import HackerNewsPostsSilverStack
 from cloud_social_analytics_stacks.silver_layer_stacks.hacker_news_posts_manual_function_stack import HackerNewsPostsManualSilverStack
@@ -21,7 +23,10 @@ load_dotenv()
 
 app = App()
 
-env = Environment(region = "eu-central-1")
+env = Environment(
+    account=os.getenv("CDK_DEFAULT_ACCOUNT"), 
+    region="eu-central-1"
+)
 
 data_stack = DataStack(app, "SocialAnalyticsDataStack", env = env)
 
@@ -91,6 +96,13 @@ gold_hn_metrics_stack = GoldHnMetricsStack(
 gold_twitter_metrics_stack = GoldTwitterMetricsStack(
     app,
     "SocialAnalyticsGoldTwitterMetricsStack",
+    data_stack.data_lake,
+    env = env
+)
+
+data_visualization_stack = AnalyticsVisualizationStack(
+    app,
+    "SocialAnalyticsDataVisualizationStack",
     data_stack.data_lake,
     env = env
 )

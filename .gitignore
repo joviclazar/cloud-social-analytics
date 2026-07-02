@@ -12,3 +12,6 @@ cdk.out
 
 .Rhistory
 config.local.json
+
+layers
+layers_old
