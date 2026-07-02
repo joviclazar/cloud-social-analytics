@@ -14,11 +14,21 @@ from constructs import Construct
 
 
 class AnalyticsVisualizationStack(Stack):
-    def __init__(self, scope: Construct, id: str, data_lake: s3.IBucket, **kwargs):
+    def __init__(
+        self,
+        scope: Construct,
+        id: str,
+        data_lake: s3.IBucket,
+        vpc: ec2.IVpc,
+        ec2_security_group: ec2.ISecurityGroup,
+        lambda_security_group: ec2.ISecurityGroup,
+        **kwargs,
+    ):
         super().__init__(scope, id, **kwargs)
 
-        # Default VPC
-        vpc = ec2.Vpc.from_lookup(self, "DefaultVpc", is_default=True)
+        # vpc, ec2_security_group (network_stack.ec2_db_sg) i
+        # lambda_security_group (network_stack.db_loader_sg) dolaze iz
+        # NetworkStack-a - ne kreiramo ih ovde, samo ih koristimo.
 
         db_secret = secretsmanager.Secret(
             self,
@@ -40,13 +50,6 @@ class AnalyticsVisualizationStack(Stack):
             ),
         )
 
-        sg = ec2.SecurityGroup(self, "AnalyticsSG", vpc=vpc, allow_all_outbound=True)
-        sg.add_ingress_rule(ec2.Peer.any_ipv4(), ec2.Port.all_tcp())
-        # sg.add_ingress_rule(ec2.Peer.ipv4("TVOJ.IP.ADRESA/32"), ec2.Port.tcp(8088))
-        # sg.add_ingress_rule(ec2.Peer.ipv4("TVOJ.IP.ADRESA/32"), ec2.Port.tcp(22))
-        # # 5432 samo unutar VPC-a da lambda može da piše:
-        # sg.add_ingress_rule(ec2.Peer.ipv4(vpc.vpc_cidr_block), ec2.Port.tcp(5432))
-
         # IAM rola za EC2
         ec2_role = iam.Role(
             self, "AnalyticsInstanceRole",
@@ -54,18 +57,40 @@ class AnalyticsVisualizationStack(Stack):
         )
         db_secret.grant_read(ec2_role)
         superset_secret.grant_read(ec2_role)
-
-        lambda_role = iam.Role(
-            self, "LambdaRole",
-            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
-        )
-        lambda_role.add_managed_policy(
+        # Opciono: omogućava SSM Session Manager pristup instanci umesto
+        # (ili pored) SSH-a - ne otvara nikakav port, kontroliše se IAM-om.
+        ec2_role.add_managed_policy(
             iam.ManagedPolicy.from_aws_managed_policy_name(
-                "service-role/AWSLambdaBasicExecutionRole"
+                "AmazonSSMManagedInstanceCore"
             )
         )
-        data_lake.grant_read(lambda_role)
-        db_secret.grant_read(lambda_role)
+
+        # Zaseban role po Lambda funkciji (incremental vs. full backfill),
+        # umesto jednog deljenog - manji blast radius ako se jedna
+        # kompromituje, i jasnija priča za "least privilege" na odbrani.
+        def make_lambda_role(id_suffix: str) -> iam.Role:
+            role = iam.Role(
+                self,
+                f"LambdaRole{id_suffix}",
+                assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+                managed_policies=[
+                    iam.ManagedPolicy.from_aws_managed_policy_name(
+                        "service-role/AWSLambdaBasicExecutionRole"
+                    ),
+                    # Obavezno za Lambdu u VPC-u (ENI management).
+                    iam.ManagedPolicy.from_aws_managed_policy_name(
+                        "service-role/AWSLambdaVPCAccessExecutionRole"
+                    ),
+                ],
+            )
+            data_lake.grant_read(role)
+            # Lambda dobija SAMO dozvolu da PROČITA secret preko boto3 u
+            # runtime-u - ne dobija lozinku upisanu u plaintext env varijablu.
+            db_secret.grant_read(role)
+            return role
+
+        incremental_role = make_lambda_role("Incremental")
+        full_backfill_role = make_lambda_role("FullBackfill")
 
         user_data = ec2.UserData.for_linux()
         user_data.add_commands(
@@ -109,8 +134,12 @@ class AnalyticsVisualizationStack(Stack):
             "-c \"CREATE DATABASE superset_meta OWNER ${DB_USER};\"",
 
             "HBA=$(sudo -u postgres psql -tAc \"show hba_file;\")",
-            "grep -q '0.0.0.0/0 md5' \"$HBA\" || "
-            "echo \"host all all 0.0.0.0/0 md5\" | sudo tee -a \"$HBA\"",
+            # Postgres prima konekcije SAMO iz VPC CIDR opsega, ne sa
+            # celog interneta (0.0.0.0/0). Ingress na 5432 je dodatno
+            # ograničen i na nivou SG-a (samo db_loader_sg), ovo je
+            # drugi sloj zaštite na nivou same baze.
+            f"grep -q '{vpc.vpc_cidr_block} md5' \"$HBA\" || "
+            f"echo \"host all all {vpc.vpc_cidr_block} md5\" | sudo tee -a \"$HBA\"",
             "sudo sed -i \"s/^#listen_addresses.*/listen_addresses = '*'/\" "
             "$(sudo -u postgres psql -tAc \"show config_file;\")",
             "systemctl restart postgresql",
@@ -158,16 +187,9 @@ class AnalyticsVisualizationStack(Stack):
             associate_public_ip_address=True,
             instance_type=ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.MEDIUM),
             machine_image=ec2.MachineImage.latest_amazon_linux2023(),
-            security_group=sg,
+            security_group=ec2_security_group,
             role=ec2_role,
             user_data=user_data,
-        )
-
-        pg_conn = (
-            "postgresql+pg8000://"
-            f"{db_secret.secret_value_from_json('username').unsafe_unwrap()}:"
-            f"{db_secret.secret_value_from_json('password').unsafe_unwrap()}"
-            f"@{instance.instance_public_dns_name}:5432/analytics"
         )
 
         aws_sdk_pandas_layer = _lambda.LayerVersion.from_layer_version_arn(
@@ -184,6 +206,21 @@ class AnalyticsVisualizationStack(Stack):
             ],
         )
 
+        # Lambda NE dobija lozinku u env varijabli. Dobija samo host, port,
+        # ime baze i ARN secreta - lozinku sama povlači preko boto3 u
+        # runtime-u (secretsmanager.get_secret_value), zahvaljujući
+        # db_secret.grant_read() koji je već dodeljen roli iznad.
+        # Konekcija ide preko PRIVATNOG DNS imena instance (ne javnog),
+        # jer je Lambda sad u istom VPC-u kao i EC2 instanca.
+        pg_env = {
+            "S3_BUCKET": data_lake.bucket_name,
+            "S3_PREFIX": "gold/",
+            "PG_HOST": instance.instance_private_dns_name,
+            "PG_PORT": "5432",
+            "PG_DATABASE": "analytics",
+            "DB_SECRET_ARN": db_secret.secret_arn,
+        }
+
         # Inkrementalna lambda - čita samo najnoviji parquet fajl po metrici.
         # Okida se automatski svakog dana preko EventBridge rule ispod.
         incremental_lambda = _lambda.Function(
@@ -198,13 +235,18 @@ class AnalyticsVisualizationStack(Stack):
             layers=[aws_sdk_pandas_layer],
             timeout=Duration.minutes(10),
             memory_size=1024,
-            role=lambda_role,
-            environment={
-                "S3_BUCKET": data_lake.bucket_name,
-                "S3_PREFIX": "gold/",
-                "PG_CONN": pg_conn,
-            },
+            role=incremental_role,
+            environment=pg_env,
+            # Lambda je u istom VPC-u kao Postgres, koristi db_loader_sg
+            # (egress: S3 preko prefix liste + 5432 ka ec2_db_sg).
+            vpc=vpc,
+            vpc_subnets=ec2.SubnetSelection(
+                subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
+            ),
+            security_groups=[lambda_security_group],
         )
+        # Instanca mora biti spremna pre nego što Lambda pokuša da se poveže.
+        incremental_lambda.node.add_dependency(instance)
 
         # EventBridge rule: pokreće inkrementalnu lambdu svakog dana u 15h.
         # Napomena: cron izrazi u EventBridge-u su uvek u UTC i ne prate
@@ -225,7 +267,7 @@ class AnalyticsVisualizationStack(Stack):
         # (ni EventBridge, ni S3 event) - poziva se isključivo ručno,
         # preko AWS konzole (Lambda -> Test) ili CLI-ja, kad zatreba
         # potpuni reload podataka.
-        _lambda.Function(
+        full_backfill_lambda = _lambda.Function(
             self,
             "GoldToPostgresFullBackfillLambda",
             runtime=_lambda.Runtime.PYTHON_3_11,
@@ -237,10 +279,12 @@ class AnalyticsVisualizationStack(Stack):
             layers=[aws_sdk_pandas_layer],
             timeout=Duration.minutes(15),
             memory_size=1024,
-            role=lambda_role,
-            environment={
-                "S3_BUCKET": data_lake.bucket_name,
-                "S3_PREFIX": "gold/",
-                "PG_CONN": pg_conn,
-            },
+            role=full_backfill_role,
+            environment=pg_env,
+            vpc=vpc,
+            vpc_subnets=ec2.SubnetSelection(
+                subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
+            ),
+            security_groups=[lambda_security_group],
         )
+        full_backfill_lambda.node.add_dependency(instance)
