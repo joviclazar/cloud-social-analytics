@@ -15,10 +15,9 @@ class AnalyticsVisualizationStack(Stack):
     def __init__(self, scope: Construct, id: str, data_lake: s3.IBucket, **kwargs):
         super().__init__(scope, id, **kwargs)
 
-        # Default VPC (već postoji u nalogu)
+        # Default VPC
         vpc = ec2.Vpc.from_lookup(self, "DefaultVpc", is_default=True)
 
-        # Tajna sa kredencijalima za bazu
         db_secret = secretsmanager.Secret(
             self,
             "AnalyticsDbSecret",
@@ -30,18 +29,30 @@ class AnalyticsVisualizationStack(Stack):
             ),
         )
 
-        # Security grupa – SVE otvoreno (nebezbedno, ali radi)
+        superset_secret = secretsmanager.Secret(
+            self,
+            "SupersetSecretKey",
+            generate_secret_string=secretsmanager.SecretStringGenerator(
+                password_length=48,
+                exclude_punctuation=True,
+            ),
+        )
+
         sg = ec2.SecurityGroup(self, "AnalyticsSG", vpc=vpc, allow_all_outbound=True)
         sg.add_ingress_rule(ec2.Peer.any_ipv4(), ec2.Port.all_tcp())
+        # sg.add_ingress_rule(ec2.Peer.ipv4("TVOJ.IP.ADRESA/32"), ec2.Port.tcp(8088))
+        # sg.add_ingress_rule(ec2.Peer.ipv4("TVOJ.IP.ADRESA/32"), ec2.Port.tcp(22))
+        # # 5432 samo unutar VPC-a da lambda može da piše:
+        # sg.add_ingress_rule(ec2.Peer.ipv4(vpc.vpc_cidr_block), ec2.Port.tcp(5432))
 
-        # IAM rola za EC2 (čitanje tajne)
+        # IAM rola za EC2
         ec2_role = iam.Role(
             self, "AnalyticsInstanceRole",
             assumed_by=iam.ServicePrincipal("ec2.amazonaws.com"),
         )
         db_secret.grant_read(ec2_role)
+        superset_secret.grant_read(ec2_role)
 
-        # IAM rola za Lambdu (S3 čitanje + tajna)
         lambda_role = iam.Role(
             self, "LambdaRole",
             assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
@@ -54,10 +65,13 @@ class AnalyticsVisualizationStack(Stack):
         data_lake.grant_read(lambda_role)
         db_secret.grant_read(lambda_role)
 
-        # UserData – instalacija PostgreSQL i Apache Superset (bez Dockera)
         user_data = ec2.UserData.for_linux()
         user_data.add_commands(
             "set -eux",
+
+            "if [ -f /etc/superset/.provisioned ]; then "
+            "echo 'Vec provisionovano, preskacem setup'; exit 0; fi",
+
             "dnf update -y",
             "dnf install -y postgresql15 postgresql15-server postgresql15-contrib "
             "python3.11 python3.11-pip python3.11-devel gcc gcc-c++ make "
@@ -73,25 +87,38 @@ class AnalyticsVisualizationStack(Stack):
             "DB_USER=$(echo \"$SECRET_JSON\" | jq -r .username)",
             "DB_PASS=$(echo \"$SECRET_JSON\" | jq -r .password)",
 
+            f"SUPERSET_SECRET=$(aws secretsmanager get-secret-value "
+            f"--secret-id {superset_secret.secret_arn} --region {self.region} "
+            f"--query SecretString --output text)",
+
+            "sudo -u postgres psql -tAc "
+            "\"SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}'\" | grep -q 1 || "
             "sudo -u postgres psql -v ON_ERROR_STOP=1 "
             "-c \"CREATE ROLE ${DB_USER} WITH LOGIN SUPERUSER PASSWORD '${DB_PASS}';\"",
+
+            "sudo -u postgres psql -tAc "
+            "\"SELECT 1 FROM pg_database WHERE datname='analytics'\" | grep -q 1 || "
             "sudo -u postgres psql -v ON_ERROR_STOP=1 "
             "-c \"CREATE DATABASE analytics OWNER ${DB_USER};\"",
+
+            "sudo -u postgres psql -tAc "
+            "\"SELECT 1 FROM pg_database WHERE datname='superset_meta'\" | grep -q 1 || "
             "sudo -u postgres psql -v ON_ERROR_STOP=1 "
             "-c \"CREATE DATABASE superset_meta OWNER ${DB_USER};\"",
 
-            "echo \"host all all 0.0.0.0/0 md5\" | sudo tee -a "
-            "$(sudo -u postgres psql -tAc \"show hba_file;\")",
+            "HBA=$(sudo -u postgres psql -tAc \"show hba_file;\")",
+            "grep -q '0.0.0.0/0 md5' \"$HBA\" || "
+            "echo \"host all all 0.0.0.0/0 md5\" | sudo tee -a \"$HBA\"",
             "sudo sed -i \"s/^#listen_addresses.*/listen_addresses = '*'/\" "
             "$(sudo -u postgres psql -tAc \"show config_file;\")",
             "systemctl restart postgresql",
 
             "python3.11 -m venv /opt/superset-venv",
             "/opt/superset-venv/bin/pip install --upgrade pip",
-            "/opt/superset-venv/bin/pip install apache-superset pg8000 gunicorn",
+
+            "/opt/superset-venv/bin/pip install apache-superset pg8000 psycopg2-binary gunicorn",
 
             "mkdir -p /etc/superset",
-            "SUPERSET_SECRET=$(openssl rand -base64 42)",
             "cat > /etc/superset/superset_config.py <<EOF\n"
             "SECRET_KEY = '${SUPERSET_SECRET}'\n"
             "SQLALCHEMY_DATABASE_URI = 'postgresql+pg8000://${DB_USER}:${DB_PASS}@localhost/superset_meta'\n"
@@ -117,6 +144,8 @@ class AnalyticsVisualizationStack(Stack):
             "systemctl daemon-reload",
             "systemctl enable superset",
             "systemctl start superset",
+
+            "touch /etc/superset/.provisioned",
         )
 
         instance = ec2.Instance(
@@ -132,7 +161,6 @@ class AnalyticsVisualizationStack(Stack):
             user_data=user_data,
         )
 
-        # Lambda za prenos parquet fajlova u PostgreSQL
         _lambda.Function(
             self,
             "GoldToPostgresLambda",
