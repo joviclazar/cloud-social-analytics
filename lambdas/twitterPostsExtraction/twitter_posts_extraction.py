@@ -43,7 +43,8 @@ def handler(event, context):
                     "author_username": chunk["user_name"],
                     "content_text": chunk["text"].apply(clean_html),
                     "post_type": chunk.apply(map_post_type, axis=1),
-                    "created_at": pd.to_datetime(chunk["date"], utc=True, errors="coerce")
+                    "created_at": pd.to_datetime(chunk["date"], utc=True, errors="coerce"),
+                    "score": pd.Series(pd.NA, index=chunk.index, dtype="Int64")
                 })
                 
                 posts_df = posts_df.dropna(subset=["created_at"])
