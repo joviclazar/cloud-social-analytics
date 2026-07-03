@@ -2,6 +2,7 @@ import boto3
 import pandas as pd
 import io
 import os
+import json
 import logging
 import re
 from collections import defaultdict
@@ -13,8 +14,26 @@ logger.setLevel(logging.INFO)
 
 S3_BUCKET = os.environ["S3_BUCKET"]
 S3_PREFIX = os.environ.get("S3_PREFIX", "gold/")
-PG_CONN = os.environ["PG_CONN"]
+PG_HOST = os.environ["PG_HOST"]
+PG_PORT = os.environ.get("PG_PORT", "5432")
+PG_DATABASE = os.environ["PG_DATABASE"]
+DB_SECRET_ARN = os.environ["DB_SECRET_ARN"]
+
 s3 = boto3.client("s3")
+secrets_client = boto3.client("secretsmanager")
+
+
+def get_pg_connection_string():
+    """Reads username/password from Secrets Manager at runtime instead of
+    a plaintext connection string baked into the environment. Fetched on
+    every cold start (and every invoke on warm containers, since this is
+    called once per lambda_handler run) - cheap and keeps credentials out
+    of CloudFormation/Lambda console entirely."""
+    secret = secrets_client.get_secret_value(SecretId=DB_SECRET_ARN)
+    creds = json.loads(secret["SecretString"])
+    username = creds["username"]
+    password = creds["password"]
+    return f"postgresql+pg8000://{username}:{password}@{PG_HOST}:{PG_PORT}/{PG_DATABASE}"
 
 
 def list_parquet_files():
@@ -144,16 +163,6 @@ def infer_sql_type(series):
     if pd.api.types.is_datetime64_any_dtype(series):
         return DateTime()
     return String()
-
-
-def normalize_pg_conn(conn_str):
-    if conn_str.startswith("postgresql+psycopg2://"):
-        return conn_str.replace("postgresql+psycopg2://", "postgresql+pg8000://", 1)
-    if conn_str.startswith("postgresql://"):
-        return conn_str.replace("postgresql://", "postgresql+pg8000://", 1)
-    if conn_str.startswith("postgres://"):
-        return conn_str.replace("postgres://", "postgresql+pg8000://", 1)
-    return conn_str
 
 
 def sanitize_table_name(name):
@@ -298,7 +307,7 @@ def lambda_handler(event, context):
 
     logger.info("Lambda started (FULL BACKFILL mode - reading ALL parquet files, file-by-file)")
 
-    engine = create_engine(normalize_pg_conn(PG_CONN), pool_pre_ping=True)
+    engine = create_engine(get_pg_connection_string(), pool_pre_ping=True)
 
     files = list_parquet_files()
     files_per_metric = get_all_files_per_metric(files)

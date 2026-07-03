@@ -3,6 +3,7 @@ from aws_cdk import (
     Stack,
     aws_lambda as _lambda,
     aws_iam as iam,
+    aws_ec2 as ec2,
     Duration,
     aws_events as events,
     aws_events_targets as targets,
@@ -11,7 +12,15 @@ from constructs import Construct
 
 class HackerNewsUsersSilverStack(Stack):
 
-    def __init__(self, scope: Construct, construct_id: str, data_bucket, **kwargs):
+    def __init__(
+        self,
+        scope: Construct,
+        construct_id: str,
+        data_bucket,
+        vpc: ec2.IVpc,
+        security_group: ec2.ISecurityGroup,
+        **kwargs,
+    ):
         super().__init__(scope, construct_id, **kwargs)
 
         role = iam.Role(
@@ -23,6 +32,12 @@ class HackerNewsUsersSilverStack(Stack):
         role.add_managed_policy(
             iam.ManagedPolicy.from_aws_managed_policy_name(
                 "service-role/AWSLambdaBasicExecutionRole"
+            )
+        )
+        role.add_managed_policy(
+            # Obavezno za Lambdu koja radi u VPC-u (ENI management).
+            iam.ManagedPolicy.from_aws_managed_policy_name(
+                "service-role/AWSLambdaVPCAccessExecutionRole"
             )
         )
 
@@ -49,6 +64,13 @@ class HackerNewsUsersSilverStack(Stack):
                 "BUCKET_NAME": data_bucket.bucket_name,
             },
             layers=[wrangler_layer],
+            # Silver Lambda - samo S3 pristup preko gateway endpoint-a,
+            # kontrolisano processing_sg iz NetworkStack-a.
+            vpc=vpc,
+            vpc_subnets=ec2.SubnetSelection(
+                subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
+            ),
+            security_groups=[security_group],
         )
 
         events.Rule(
@@ -62,4 +84,3 @@ class HackerNewsUsersSilverStack(Stack):
                 targets.LambdaFunction(fn)
             ]
         )
-

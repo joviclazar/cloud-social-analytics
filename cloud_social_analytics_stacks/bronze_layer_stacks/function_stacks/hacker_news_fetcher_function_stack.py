@@ -4,6 +4,7 @@ from aws_cdk import (
     aws_s3 as s3,
     aws_lambda as _lambda,
     aws_iam as iam,
+    aws_ec2 as ec2,
     aws_events as events,
     aws_events_targets as targets,
     BundlingOptions,
@@ -15,7 +16,15 @@ from constructs import Construct
 
 class HackerNewsFetcherFunctionStack(Stack):
 
-    def __init__(self, scope: Construct, construct_id: str, data_bucket: s3.IBucket, **kwargs) -> None:
+    def __init__(
+        self,
+        scope: Construct,
+        construct_id: str,
+        data_bucket: s3.IBucket,
+        vpc: ec2.IVpc,
+        security_group: ec2.ISecurityGroup,
+        **kwargs,
+    ) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
         lambda_role = iam.Role(
@@ -25,7 +34,11 @@ class HackerNewsFetcherFunctionStack(Stack):
             managed_policies=[
                 iam.ManagedPolicy.from_aws_managed_policy_name(
                     "service-role/AWSLambdaBasicExecutionRole"
-                )
+                ),
+                # Obavezno za Lambdu koja radi u VPC-u (ENI management).
+                iam.ManagedPolicy.from_aws_managed_policy_name(
+                    "service-role/AWSLambdaVPCAccessExecutionRole"
+                ),
             ],
         )
         data_bucket.grant_read_write(lambda_role)
@@ -56,6 +69,13 @@ class HackerNewsFetcherFunctionStack(Stack):
             environment={
                 "BUCKET_NAME": data_bucket.bucket_name,
             },
+            # Bronze collector - u privatnom subnetu, izlaz ka HN API-ju
+            # preko NAT-a, kontrolisano collector_sg iz NetworkStack-a.
+            vpc=vpc,
+            vpc_subnets=ec2.SubnetSelection(
+                subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
+            ),
+            security_groups=[security_group],
         )
 
         events.Rule(
