@@ -94,6 +94,24 @@ class NetworkStack(Stack):
             "HTTPS ka S3 preko gateway endpoint-a (ograniceno na S3 IP opseg)",
         )
 
+        self.hn_sg = ec2.SecurityGroup(
+            self,
+            "HackerNewsUsersLambdaSG",
+            vpc=self.vpc,
+            description="HN Users silver Lambda - S3 (gateway endpoint) + Firebase karma API",
+            allow_all_outbound=False,
+        )
+        self.hn_sg.add_egress_rule(
+            ec2.Peer.prefix_list(s3_prefix_list_id),
+            ec2.Port.tcp(443),
+            "HTTPS ka S3 preko gateway endpoint-a",
+        )
+        self.hn_sg.add_egress_rule(
+            ec2.Peer.any_ipv4(),
+            ec2.Port.tcp(443),
+            "HTTPS ka Firebase HN karma API-ju",
+        )
+
         self.db_loader_sg = ec2.SecurityGroup(
             self,
             "DbLoaderLambdaSG",

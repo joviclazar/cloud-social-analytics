@@ -76,7 +76,7 @@ hacker_news_users_manual_silver_stack = HackerNewsUsersManualSilverStack(
     "SocialAnalyticsHackerNewsUsersManualSilverStack",
     data_stack.data_lake,
     vpc=network_stack.vpc,
-    security_group=network_stack.processing_sg,
+    security_group=network_stack.hn_sg,
     env = env
 )
 
@@ -85,7 +85,7 @@ hacker_news_posts_manual_silver_stack = HackerNewsPostsManualSilverStack(
     "SocialAnalyticsHackerNewsPostsManualSilverStack",
     data_stack.data_lake,
     vpc=network_stack.vpc,
-    security_group=network_stack.processing_sg,
+    security_group=network_stack.hn_sg,
     env = env
 )
 
@@ -94,7 +94,7 @@ hacker_news_users_silver_stack = HackerNewsUsersSilverStack(
     "SocialAnalyticsHackerNewsUsersSilverStack",
     data_stack.data_lake,
     vpc=network_stack.vpc,
-    security_group=network_stack.processing_sg,
+    security_group=network_stack.hn_sg,
     env = env
 )
 
@@ -103,7 +103,7 @@ hacker_news_posts_silver_stack = HackerNewsPostsSilverStack(
     "SocialAnalyticsHackerNewsPostsSilverStack",
     data_stack.data_lake,
     vpc=network_stack.vpc,
-    security_group=network_stack.processing_sg,
+    security_group=network_stack.hn_sg,
     env = env
 )
 

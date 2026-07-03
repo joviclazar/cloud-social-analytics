@@ -18,7 +18,7 @@ def split_day(start_dt, parts=48):
 
 
 def fetch_interval(bucket, tag, start, end, interval_id, base_prefix):
-    base_url = "http://hn.algolia.com/api/v1"
+    base_url = "https://hn.algolia.com/api/v1"
 
     response = requests.get(
         base_url + "/search_by_date",
